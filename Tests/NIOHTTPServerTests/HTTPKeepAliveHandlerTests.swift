@@ -651,7 +651,10 @@ struct HTTPKeepAliveHandlerTests {
             }
 
             let next = try await responseIterator.next()
-            #expect(next == nil, "Expected channel to be closed after the last response; got \(String(describing: next))")
+            #expect(
+                next == nil,
+                "Expected channel to be closed after the last response; got \(String(describing: next))"
+            )
         }
     }
 
