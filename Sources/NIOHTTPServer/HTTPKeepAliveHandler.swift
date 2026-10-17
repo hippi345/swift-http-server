@@ -72,10 +72,11 @@ final class HTTPKeepAliveHandler: ChannelDuplexHandler {
     private var requestEndReceived: Bool = true
 
     /// `true` if we've committed to closing the connection after this response's
-    /// `.end` is written. Set when the buffer is flushed while request `.end` has
-    /// not yet arrived, and when a request is aborted (so a still-buffered head
-    /// picks up `Connection: close` on its way out). Cleared when a new request
-    /// begins.
+    /// `.end` is written. Set when the request head carries `Connection: close`,
+    /// when the buffer is flushed while request `.end` has not yet arrived, and
+    /// when a request is aborted (so a still-buffered head picks up
+    /// `Connection: close` on its way out). Cleared when a new request begins
+    /// unless that request also asks to close.
     private var closeAfterResponseEnd: Bool = false
 
     private var finalResponseState: FinalResponseState = .notStarted
@@ -143,11 +144,13 @@ final class HTTPKeepAliveHandler: ChannelDuplexHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let part = self.unwrapInboundIn(data)
         switch part {
-        case .head:
+        case .head(let request):
             // Begin a new request. (Any previous request's response must have
             // completed already since HTTPServerPipelineHandler enforces ordering.)
             self.requestEndReceived = false
-            self.closeAfterResponseEnd = false
+            // Honor a client `Connection: close` (RFC 9112 §9.6): this is the last
+            // request on the connection, so close after the response ends.
+            self.closeAfterResponseEnd = request.headerFields[.connection]?.lowercased() == "close"
             self.finalResponseState = .notStarted
         case .body:
             break
@@ -181,9 +184,15 @@ final class HTTPKeepAliveHandler: ChannelDuplexHandler {
                 return
             }
             if self.requestEndReceived {
-                // Request fully read; stream the response directly.
+                // Request fully read; stream the response directly. If the client
+                // asked to close, amend the head so the peer sees `Connection: close`.
                 self.finalResponseState = .streaming
-                context.write(data, promise: promise)
+                if self.closeAfterResponseEnd, case .head(var response) = part {
+                    response.headerFields[.connection] = "close"
+                    context.write(self.wrapOutboundOut(.head(response)), promise: promise)
+                } else {
+                    context.write(data, promise: promise)
+                }
             } else {
                 // Start buffering with the head. Additional parts (body, end) the
                 // handler may write before the next deadline are appended below.

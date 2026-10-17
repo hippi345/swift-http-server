@@ -446,6 +446,132 @@ struct HTTPKeepAliveHandlerTests {
         }
     }
 
+    /// Verifies that when the request head carries `Connection: close`, the
+    /// response is amended with `Connection: close` and the server closes the
+    /// connection after writing response `.end`, even though the request was
+    /// fully received before the response was written.
+    @available(anyAppleOS 27.0, *)
+    @Test(
+        "Request Connection: close closes the connection after the response ends",
+        arguments: [NIOHTTPServer.HTTPVersion.plaintextHTTP1_1, .http1_1]
+    )
+    func testRequestConnectionCloseClosesAfterResponse(http1Variant: NIOHTTPServer.HTTPVersion) async throws {
+        let (server, clientConfiguration) = try TestHelpers.makeServerAndClientConfiguration(
+            for: http1Variant,
+            clientLogger: self.clientLogger,
+            serverLogger: self.serverLogger
+        )
+
+        try await TestHelpers.withClientServerRequestChannel(
+            clientConfiguration: clientConfiguration,
+            server: server,
+            serverHandler: HTTPServerClosureRequestHandler { _, _, reader, sender in
+                var requestBody = UniqueArray<UInt8>()
+                requestBody.reserveCapacity(1024)
+                _ = try await reader.collect(into: &requestBody)
+
+                var buffer = UniqueArray(copying: "ok".utf8)
+                try await sender.sendAndFinish(
+                    .init(status: .ok, headerFields: [.contentLength: "2"]),
+                    buffer: &buffer
+                )
+            }
+        ) { _, inbound, outbound in
+            var request = HTTPRequest(
+                method: .get,
+                scheme: .makeScheme(for: http1Variant),
+                authority: "test",
+                path: "/"
+            )
+            request.headerFields[.connection] = "close"
+            try await outbound.write(.head(request))
+            try await outbound.write(.end(nil))
+
+            var responseIterator = inbound.makeAsyncIterator()
+            let headPart = try await responseIterator.next()
+            guard case .head(let response) = headPart else {
+                Issue.record("Expected .head, got \(String(describing: headPart))")
+                return
+            }
+            #expect(response.status == .ok)
+            #expect(
+                response.headerFields[.connection] == "close",
+                "Expected Connection: close on the response, got headers: \(response.headerFields)"
+            )
+
+            var sawEnd = false
+            while !sawEnd {
+                let part = try await responseIterator.next()
+                switch part {
+                case .body:
+                    continue
+                case .end:
+                    sawEnd = true
+                case .none:
+                    Issue.record("Stream ended before response .end")
+                    return
+                case .head:
+                    Issue.record("Unexpected second .head: \(String(describing: part))")
+                    return
+                }
+            }
+
+            let next = try await responseIterator.next()
+            #expect(next == nil, "Expected channel to be closed; got \(String(describing: next))")
+        }
+    }
+
+    /// Embedded-channel counterpart: a fully received request whose head carries
+    /// `Connection: close` must amend the response head and close after `.end`.
+    @available(anyAppleOS 27.0, *)
+    @Test func testRequestConnectionCloseClosesEmbeddedChannelAfterResponseEnd() throws {
+        let channel = EmbeddedChannel()
+        try channel.connect(to: try .init(ipAddress: "127.0.0.1", port: 0)).wait()
+        try channel.pipeline.syncOperations.addHandler(HTTPKeepAliveHandler())
+
+        try channel.writeInbound(
+            HTTPRequestPart.head(
+                .init(
+                    method: .get,
+                    scheme: "http",
+                    authority: "test",
+                    path: "/",
+                    headerFields: [.connection: "close"]
+                )
+            )
+        )
+        try channel.writeInbound(HTTPRequestPart.end(nil))
+
+        try channel.writeOutbound(
+            HTTPResponsePart.head(.init(status: .ok, headerFields: [.contentLength: "0"]))
+        )
+        try channel.writeOutbound(HTTPResponsePart.end(nil))
+        channel.embeddedEventLoop.run()
+
+        switch try channel.readOutbound(as: HTTPResponsePart.self) {
+        case .head(let response):
+            #expect(response.status == .ok)
+            #expect(
+                response.headerFields[.connection] == "close",
+                "Expected Connection: close, got headers: \(response.headerFields)"
+            )
+
+        case let other:
+            Issue.record("Expected the response head, got \(String(describing: other))")
+        }
+
+        switch try channel.readOutbound(as: HTTPResponsePart.self) {
+        case .end:
+            ()
+
+        case let other:
+            Issue.record("Expected response .end, got \(String(describing: other))")
+        }
+
+        #expect(!channel.isActive, "Expected the channel to close after response .end")
+        _ = try? channel.finish()
+    }
+
     @available(anyAppleOS 27.0, *)
     @Test func channelClosesOnConnectionError() async throws {
         let channel = EmbeddedChannel()
